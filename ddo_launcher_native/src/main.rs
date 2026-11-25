@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use directories::ProjectDirs;
@@ -7,8 +8,10 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
+use crate::local_server::LocalServer;
 use crate::server::Server;
 
+mod local_server;
 mod server;
 
 const CONFIG_FILE_NAME: &str = "config.json";
@@ -17,6 +20,7 @@ enum TokioRequest {
     BeginRequestRepaintLoop(egui::Context),
     Login(LoginRequest),
     Register(RegisterRequest),
+    LocalPlay(LocalPlayRequest),
     Shutdown,
 }
 
@@ -35,9 +39,15 @@ struct RegisterRequest {
     account: Account,
 }
 
+struct LocalPlayRequest {
+    exe_path: String,
+    prefix_path: String,
+}
+
 struct Account {
     name: String,
     password: String,
+    email: String,
     server: Server,
 }
 
@@ -103,8 +113,10 @@ fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 2 {
-        eprintln!("usage: ddo_launcher_native [server name]");
+        eprintln!("usage: ddo_launcher_native [server name | --local-play]");
         return Ok(());
+    } else if args.len() == 2 && args[1] == "--local-play" {
+        run_local_play(config)?;
     } else if args.len() == 2 {
         run_simple(&args[1], config)?;
     } else {
@@ -129,6 +141,7 @@ fn run_simple(server_name: &str, config: AppConfig) -> anyhow::Result<()> {
             let account = Account {
                 name: config.account.clone(),
                 password: config.password.clone(),
+                email: String::new(),
                 server: server.clone(),
             };
 
@@ -157,6 +170,19 @@ fn run_simple(server_name: &str, config: AppConfig) -> anyhow::Result<()> {
 
             Ok(())
         })())
+}
+
+fn run_local_play(config: AppConfig) -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(local_play(
+            LocalPlayRequest {
+                exe_path: config.exe_path,
+                prefix_path: config.prefix_path,
+            },
+            None,
+        ))
 }
 
 fn run_gui(config: AppConfig, dirs: ProjectDirs) -> anyhow::Result<()> {
@@ -277,6 +303,23 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
                     }
                 });
             }
+            TokioRequest::LocalPlay(request) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    tx.send(TokioResponse::ChildProcessActive(true))
+                        .await
+                        .unwrap();
+                    if let Err(e) = local_play(request, Some(&tx)).await {
+                        eprintln!("local play failed: {e:#}");
+                        tx.send(TokioResponse::Status(format!("{e:#}")))
+                            .await
+                            .unwrap();
+                    }
+                    tx.send(TokioResponse::ChildProcessActive(false))
+                        .await
+                        .unwrap();
+                });
+            }
             TokioRequest::Shutdown => {
                 println!("tokio thread received shutdown request");
                 break;
@@ -310,7 +353,7 @@ async fn dl_server_action(
         },
         account: &account.name,
         password: &account.password,
-        email: "",
+        email: &account.email,
     };
     dbg!(&request_data);
 
@@ -322,8 +365,95 @@ async fn dl_server_action(
     Ok(response)
 }
 
+async fn report_status(tx: Option<&mpsc::Sender<TokioResponse>>, text: &str) {
+    println!("{text}");
+    if let Some(tx) = tx {
+        tx.send(TokioResponse::Status(text.into())).await.unwrap();
+    }
+}
+
+/// Starts the local server unless one is already running, logs in with the local account and runs the game.
+/// A server started here is stopped when the game exits or a step fails.
+async fn local_play(
+    request: LocalPlayRequest,
+    tx: Option<&mpsc::Sender<TokioResponse>>,
+) -> anyhow::Result<()> {
+    let root = local_server::root_dir(Path::new(&request.exe_path))?;
+
+    let mut owned_server = None;
+    if local_server::is_any_port_alive().await {
+        report_status(tx, "Using the local server that is already running").await;
+    } else {
+        report_status(tx, "Checking local server files...").await;
+        let server_dir = local_server::ensure_installed(&root).await?;
+        report_status(tx, "Applying local server database updates...").await;
+        local_server::migrate_database(&server_dir).await?;
+        report_status(tx, "Starting the local server...").await;
+        owned_server = Some(LocalServer::start(&root, &server_dir)?);
+    }
+
+    let result = play_on_local_server(request, owned_server.as_mut(), tx).await;
+    if let Some(server) = owned_server {
+        server.stop().await?;
+    }
+    result
+}
+
+async fn play_on_local_server(
+    request: LocalPlayRequest,
+    mut owned_server: Option<&mut LocalServer>,
+    tx: Option<&mpsc::Sender<TokioResponse>>,
+) -> anyhow::Result<()> {
+    if let Some(server) = owned_server.as_deref_mut() {
+        report_status(tx, "Waiting for the local server to finish starting...").await;
+        server.wait_for_dl_server().await?;
+    }
+
+    report_status(tx, "Signing in to the local server...").await;
+    let account = Account {
+        name: local_server::ACCOUNT_NAME.into(),
+        password: local_server::ACCOUNT_PASSWORD.into(),
+        email: local_server::ACCOUNT_EMAIL.into(),
+        server: local_server::server(),
+    };
+    let mut response = dl_server_action(DLServerAction::Login, &account).await?;
+    if response.token.is_none() {
+        dl_server_action(DLServerAction::Register, &account).await?;
+        response = dl_server_action(DLServerAction::Login, &account).await?;
+    }
+    let Some(token) = response.token else {
+        anyhow::bail!(
+            "Local login failed: {}",
+            response.error.or(response.message).unwrap_or_default()
+        );
+    };
+
+    if let Some(server) = owned_server {
+        report_status(tx, "Waiting for the game server to finish starting...").await;
+        server.wait_for_lobby().await?;
+    }
+
+    report_status(tx, "Starting Dragon's Dogma Online...").await;
+    spawn_umu(
+        LoginRequest {
+            account,
+            exe_path: request.exe_path,
+            prefix_path: request.prefix_path,
+        },
+        token,
+    )
+    .await;
+    report_status(tx, "Game exited").await;
+    Ok(())
+}
+
 async fn spawn_umu(login: LoginRequest, token: String) {
+    // DDO.exe opens nativePC and its other data relative to the working directory.
+    let game_dir = Path::new(&login.exe_path)
+        .parent()
+        .unwrap_or(Path::new("."));
     let mut child = Command::new("umu-run")
+        .current_dir(game_dir)
         .env("WINEPREFIX", &login.prefix_path)
         .arg(&login.exe_path)
         .arg(format!("addr={}", login.account.server.lobby_ip))
@@ -411,6 +541,7 @@ impl App {
                 account: Account {
                     name: self.config.account.clone(),
                     password: self.config.password.clone(),
+                    email: String::new(),
                     server: self.config.servers[self.config.selected_server].clone(),
                 },
                 exe_path: self.config.exe_path.clone(),
@@ -429,8 +560,23 @@ impl App {
                 account: Account {
                     name: self.config.account.clone(),
                     password: self.config.password.clone(),
+                    email: String::new(),
                     server: self.config.servers[self.config.selected_server].clone(),
                 },
+            }))
+            .unwrap();
+    }
+
+    fn local_play(&mut self) {
+        if self.config.exe_path.is_empty() {
+            self.status_text = "Error: \"DDO.exe Path\" must not be empty".into();
+            return;
+        }
+
+        self.tx
+            .blocking_send(TokioRequest::LocalPlay(LocalPlayRequest {
+                exe_path: self.config.exe_path.clone(),
+                prefix_path: self.config.prefix_path.clone(),
             }))
             .unwrap();
     }
@@ -493,6 +639,10 @@ impl eframe::App for App {
                     }
                     ui.checkbox(&mut self.config.remember_me, "Remember Me");
                 });
+                if ui.button("Local Play").clicked() {
+                    println!("local play!");
+                    self.local_play();
+                }
 
                 ui.add_space(20.0);
 
